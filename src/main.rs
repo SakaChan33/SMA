@@ -3,7 +3,7 @@
 
 
 use static_malware_analysis::binary::{self, Binary, Format, Section};
-use static_malware_analysis::{cfg, hexdump, parse, rules};
+use static_malware_analysis::{cfg, hexdump, json, parse, rules};
 use std::process::ExitCode;
 
 // Which analysis to run. Scan is the default; the rest are planned milestones.
@@ -23,6 +23,8 @@ fn print_help() {
     println!("  -d, --disassemble    build a function's control-flow graph (CFG)");
     println!("  -b, --debug          dynamic / debug analysis                 [planned: future]\n");
     println!("scan options:");
+    println!("      --json           emit the report as machine-readable JSON (for the");
+    println!("                       evaluation pipeline) instead of the human report");
     println!("  -f, --full           also print the COMPLETE hex of the headers and every");
     println!("                       section to stdout (massive for large files)");
     println!("      --dump-sections <dir>   write one file per section (specifics + FULL");
@@ -47,6 +49,7 @@ fn main() -> ExitCode {
     let mut dot = false; // -d DOT output
     let mut disasm_all = false; // -d --all: linear disassembly of every exec section
     let mut list_calls = false; // -d --calls: list the program's call targets
+    let mut json = false; // -s --json: machine-readable output
 
     let mut i = 0;
     while i < args.len() {
@@ -58,6 +61,7 @@ fn main() -> ExitCode {
             "-s" | "--scan" => mode = Mode::Scan,
             "-d" | "--disassemble" => mode = Mode::Disassemble,
             "-b" | "--debug" => mode = Mode::Debug,
+            "--json" => json = true,
             "-f" | "--full" => full = true,
             "--dot" => dot = true,
             "--all" => disasm_all = true,
@@ -127,6 +131,12 @@ fn main() -> ExitCode {
     };
 
     match mode {
+        Mode::Scan if json => {
+            // M8: machine-readable output for the evaluation pipeline. Suppresses
+            // the human report and the hex/dump extras.
+            let findings = rules::assess_imports(&bin.imports);
+            print!("{}", json::report(&path, bytes.len(), &bin, &findings));
+        }
         Mode::Scan => {
             // stdout: the generalized report. With -f, also stream the complete
             // hex of the headers and every section after it.

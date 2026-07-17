@@ -5,6 +5,7 @@ pub mod entropy;
 pub mod error;
 pub mod hexdump;
 pub mod imports;
+pub mod json;
 pub mod pe;
 pub mod reader;
 pub mod rules;

@@ -143,11 +143,11 @@ for further inspection, but it will never be 100% accurate.
 | **M9** | Plugin architecture (analyzers as plugins) | extensibility |
 | **M10** | **Evaluation:** run over labeled dataset → precision/recall/F1, ROC/AUC vs. baseline; document false positives + limits |
 
-**Status:** M0–M7 complete — PE parser, entropy, imports, suspicious-API rules,
+**Status:** M0–M8 complete — PE parser, entropy, imports, suspicious-API rules,
 strings + IOCs, a **format-abstraction layer with ELF support** (one `sma`
-analyzes both Windows PE and Linux ELF), and a **disassembler + control-flow
-graph** (`sma -d`, text or Graphviz DOT, built on Capstone). M8 (machine-readable
-JSON report) is next.
+analyzes both Windows PE and Linux ELF), a **disassembler + control-flow graph**
+(`sma -d`, text or Graphviz DOT, built on Capstone), and a **machine-readable JSON
+report** (`sma --json`) for the evaluation pipeline. M9 (plugin architecture) is next.
 
 ---
 
@@ -216,7 +216,8 @@ disassemble options:
 ```sh
 sma -s "C:/Windows/System32/notepad.exe"                 # or just: sma <path>
 sma "C:/Windows/explorer.exe" | grep -A20 '^capabilities' # pipe like any Unix tool
-sma "C:/Windows/System32/cmd.exe" > output/cmd.exe.analysis.txt   # save a report
+sma "C:/Windows/System32/cmd.exe" > data/cmd.exe.analysis.txt     # save a report
+sma --json "C:/Windows/System32/notepad.exe" > data/notepad.json  # machine-readable (M8)
 
 # -f appends the ENTIRE hex of every section to the report. Redirect to a file:
 sma -s -f "C:/path/to/big.exe" > output/big.full.txt      # e.g. 223 MB exe -> ~1 GB text
