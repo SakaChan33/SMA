@@ -287,6 +287,13 @@ Instead, it provides a reproducible experimental platform for extracting static 
 
 The implementation exists to answer the research question through controlled experimentation.
 
+## Artifical Intelligence Usage
+
+This project includes the use of Artifical Intelligence. Claude Opus 4.8 was the primary AI model used to generate aspects of the program
+such as the projects scaffolding, README.md (specific parts), and some code. Claude was also the model responsible for the learning
+aspect of the project. Additionally, Claude was used to push the
+project to Github.
+
 ## Stuff to Include
 
 These are some additional questions to consider. Not necessarily for research purposes, but for the artifact and the reader themselves.
