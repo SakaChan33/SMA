@@ -1,0 +1,15 @@
+/target
+/docs
+/data
+/output
+/dist
+/NOTES.md
+/summary.md
+
+# Experiment samples: NEVER commit binaries into tests/ -- especially malware.
+# Committing malware violates GitHub's terms and is dangerous. Keep only the
+# folder structure and docs; every sample file is ignored.
+/tests/infected/*
+/tests/normal/*
+!/tests/infected/.gitkeep
+!/tests/normal/.gitkeep

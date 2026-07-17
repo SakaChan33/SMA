@@ -1,0 +1,49 @@
+name: Release
+
+# Ships prebuilt, self-contained binaries so users never have to build anything.
+# Push a version tag and this builds `sma` for Windows + Linux and attaches them
+# to a GitHub Release:
+#
+#     git tag v0.1.0
+#     git push origin v0.1.0
+#
+# Capstone is compiled from source and linked INTO the binary, so there are no
+# separate libraries to ship -- one file per platform is the whole download.
+on:
+  push:
+    tags: [ 'v*' ]
+
+permissions:
+  contents: write   # needed to create the release and upload assets
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            bin: sma.exe
+            asset: sma-windows-x86_64.exe
+            # Statically link the C runtime so the .exe runs on a clean Windows
+            # box with nothing installed.
+            rustflags: "-C target-feature=+crt-static"
+          - os: ubuntu-latest
+            bin: sma
+            asset: sma-linux-x86_64
+            rustflags: ""
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build release
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+        run: cargo build --release
+      - name: Stage binary
+        shell: bash
+        run: cp "target/release/${{ matrix.bin }}" "${{ matrix.asset }}"
+      - name: Attach to the GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.asset }}
+          generate_release_notes: true

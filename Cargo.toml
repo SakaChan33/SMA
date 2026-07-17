@@ -1,0 +1,17 @@
+[package]
+name = "static_malware_analysis"
+version = "0.1.0"
+edition = "2021"
+description = "Static malware analysis framework (my implementation)"
+
+# The library crate stays `static_malware_analysis` (the reusable engine); the
+# command-line binary is installed as the short, memorable `sma`.
+[[bin]]
+name = "sma"
+path = "src/main.rs"
+
+# M1-M6 are hand-rolled from std only, so I learn each format byte-by-byte.
+# M7 adds Capstone (the industry-standard disassembler) for x86-64 instruction
+# decoding; the control-flow-graph construction on top of it is still mine.
+[dependencies]
+capstone = "0.12"
