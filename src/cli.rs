@@ -104,6 +104,19 @@ pub fn parse(args: &[String]) -> Result<Invocation, String> {
 
         if !a.starts_with('-') {
             if let Some(seen) = &path {
+                // A bare address as a positional is a forgotten flag, not a
+                // second file. Saying "already analyzing '0x510c8'" would be
+                // technically true and useless -- name the real mistake.
+                if let Some(flag) = address_flag(verb) {
+                    let addr_first = looks_like_address(seen);
+                    if addr_first || looks_like_address(a) {
+                        let (addr, file) = if addr_first { (seen.as_str(), a) } else { (a, seen.as_str()) };
+                        return Err(format!(
+                            "error: an address needs the {flag} flag, it is not a positional argument\n       \
+                             try: sma {verb} {flag} {addr} \"{file}\""
+                        ));
+                    }
+                }
                 return Err(format!(
                     "error: unexpected extra argument '{a}' (already analyzing '{seen}')\n{HINT}"
                 ));
@@ -179,6 +192,35 @@ fn check_owner(flag: &str, verb: &str) -> Result<(), String> {
         return Err(format!("error: {flag} no longer exists.\n       {advice}"));
     }
     Err(format!("error: unknown option '{flag}'\n{HINT}"))
+}
+
+// The flag each verb uses to take an address, if it takes one at all.
+pub fn address_flag(verb: &str) -> Option<&'static str> {
+    match verb {
+        "cfg" | "disasm" => Some("--addr"),
+        "hex" => Some("--at"),
+        _ => None,
+    }
+}
+
+// Is this token a hex address someone forgot to put a flag on?
+//
+// An explicit 0x prefix is unambiguous. Without one, the bar is five hex digits
+// and nothing path-like, because four-letter hex words ("face", "beef", "cafe")
+// are plausible filenames and guessing wrong on those would be worse than not
+// guessing at all. This only ever produces a suggestion in an error message,
+// never a silent reinterpretation of what was typed.
+const MIN_BARE_HEX_DIGITS: usize = 5;
+
+pub fn looks_like_address(s: &str) -> bool {
+    match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        Some(rest) => !rest.is_empty() && rest.chars().all(|c| c.is_ascii_hexdigit()),
+        None => {
+            s.len() >= MIN_BARE_HEX_DIGITS
+                && s.chars().all(|c| c.is_ascii_hexdigit())
+                && !s.contains(['.', '/', '\\'])
+        }
+    }
 }
 
 // Advance past the flag and hand back its value.
@@ -377,6 +419,39 @@ mod tests {
             run(&["disasm", "a.exe", "--count", "40"]).unwrap(),
             Invocation::Run(Command::Disasm { count: Some(40), .. })
         ));
+    }
+
+    #[test]
+    fn a_positional_address_names_the_flag_it_needs() {
+        // The mistake this guards: `sma disasm 0x510c8 file.exe` used to report
+        // "unexpected extra argument 'file.exe' (already analyzing '0x510c8')",
+        // which blames the file and never mentions --addr.
+        let err = run(&["disasm", "0x510c8", "a.exe"]).unwrap_err();
+        assert!(err.contains("--addr"), "got: {err}");
+        assert!(err.contains("sma disasm --addr 0x510c8 \"a.exe\""), "got: {err}");
+
+        // Either order, and hex takes --at rather than --addr.
+        let err = run(&["cfg", "a.exe", "0x510c8"]).unwrap_err();
+        assert!(err.contains("sma cfg --addr 0x510c8 \"a.exe\""), "got: {err}");
+        let err = run(&["hex", "a.exe", "0x1000"]).unwrap_err();
+        assert!(err.contains("sma hex --at 0x1000 \"a.exe\""), "got: {err}");
+
+        // Verbs with no address flag keep the plain message.
+        let err = run(&["scan", "a.exe", "0x510c8"]).unwrap_err();
+        assert!(err.contains("extra argument"), "got: {err}");
+    }
+
+    #[test]
+    fn ordinary_filenames_are_not_mistaken_for_addresses() {
+        for name in ["notepad.exe", "abc", "data.bin", "C:\\tmp\\beef", "face"] {
+            assert!(!looks_like_address(name), "{name} should not read as an address");
+        }
+        for addr in ["0x1400", "0X1400", "510c8", "deadbeef"] {
+            assert!(looks_like_address(addr), "{addr} should read as an address");
+        }
+        // Two real files still produce the plain duplicate-path error.
+        let err = run(&["disasm", "a.exe", "b.exe"]).unwrap_err();
+        assert!(err.contains("extra argument"), "got: {err}");
     }
 
     #[test]
