@@ -1,4 +1,4 @@
-use crate::binary::{clamped_slice, Binary, Format, Import, Section};
+use crate::binary::{clamped_slice, Binary, Export, Format, Import, ImportedFn, Section};
 use crate::entropy::shannon_entropy;
 use crate::error::ParseError;
 use crate::imports::read_cstr;
@@ -141,6 +141,8 @@ pub fn parse(data: &[u8]) -> Result<Binary, ParseError> {
         .min()
         .unwrap_or(0);
 
+    let exports = parse_dynamic_exports(data, &shdrs, is64);
+    let overlay = crate::binary::find_overlay(data, &sections, None);
     let strings = crate::strings::scan(data, 5);
 
     Ok(Binary {
@@ -153,8 +155,57 @@ pub fn parse(data: &[u8]) -> Result<Binary, ParseError> {
         image_base,
         sections,
         imports,
+        exports,
+        overlay,
+        pe_meta: None, // subsystem, Authenticode and TLS callbacks are PE concepts
         strings,
     })
+}
+
+// Exports = *defined* dynamic symbols (st_shndx != SHN_UNDEF), the mirror of the
+// undefined ones `parse_dynamic_imports` collects. These are the entry points a
+// shared object offers to everyone else.
+fn parse_dynamic_exports(data: &[u8], shdrs: &[Shdr], is64: bool) -> Vec<Export> {
+    let r = ByteReader::new(data);
+    let mut exports = Vec::new();
+
+    let dynsym = match shdrs.iter().find(|s| s.sh_type == SHT_DYNSYM) {
+        Some(s) => s,
+        None => return exports,
+    };
+    let strtab = match shdrs.get(dynsym.link as usize) {
+        Some(s) => s,
+        None => return exports,
+    };
+    let symsize = if dynsym.entsize > 0 {
+        dynsym.entsize as usize
+    } else if is64 {
+        24
+    } else {
+        16
+    };
+    let count = (dynsym.size as usize) / symsize.max(1);
+
+    for i in 0..count.min(500_000) {
+        let base = dynsym.offset as usize + i * symsize;
+        let name_off = r.u32_le(base).unwrap_or(0);
+        // st_shndx and st_value sit at different offsets in the two layouts.
+        let (shndx, value) = if is64 {
+            (r.u16_le(base + 6).unwrap_or(0), r.u64_le(base + 8).unwrap_or(0))
+        } else {
+            (r.u16_le(base + 14).unwrap_or(0), r.u32_le(base + 4).unwrap_or(0) as u64)
+        };
+        if shndx == 0 || name_off == 0 || value == 0 {
+            continue; // undefined (that's an import), unnamed, or absolute-zero
+        }
+        let name = read_cstr(data, strtab.offset as usize + name_off as usize);
+        if !name.is_empty() {
+            // ELF has no ordinals and no forwarders.
+            exports.push(Export { name, rva: value, ordinal: 0, forwarder: None });
+        }
+    }
+
+    exports
 }
 
 fn read_shdr(r: &ByteReader, base: usize, is64: bool) -> Result<Shdr, ParseError> {
@@ -246,7 +297,9 @@ fn parse_dynamic_imports(data: &[u8], shdrs: &[Shdr], is64: bool) -> Vec<Import>
                 if shndx == 0 && name_off != 0 {
                     let name = read_cstr(data, strtab.offset as usize + name_off as usize);
                     if !name.is_empty() {
-                        funcs.push(name);
+                        // No slot address: placing an ELF import in memory means
+                        // walking .rela.plt relocations, which we don't parse.
+                        funcs.push(ImportedFn::named(name));
                     }
                 }
             }

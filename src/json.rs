@@ -23,6 +23,11 @@ fn q(s: &str) -> String {
     format!("\"{}\"", esc(s))
 }
 
+// The same, for other modules that emit their own JSON views.
+pub fn quote(s: &str) -> String {
+    q(s)
+}
+
 // Join items into a JSON array body.
 fn arr(items: Vec<String>) -> String {
     format!("[{}]", items.join(", "))
@@ -81,7 +86,7 @@ pub fn report(path: &str, size: usize, bin: &Binary, findings: &[Finding]) -> St
     s.push_str("  \"imports\": [\n");
     for (i, imp) in bin.imports.iter().enumerate() {
         let comma = if i + 1 < bin.imports.len() { "," } else { "" };
-        let funcs = arr(imp.functions.iter().map(|f| q(f)).collect());
+        let funcs = arr(imp.names().map(q).collect());
         s.push_str(&format!("    {{\"dll\": {}, \"functions\": {}}}{comma}\n", q(&imp.dll), funcs));
     }
     s.push_str("  ],\n");
@@ -154,6 +159,9 @@ mod tests {
                 entropy: 6.5,
             }],
             imports: vec![],
+            exports: vec![],
+            overlay: None,
+            pe_meta: None,
             strings: StringScan::default(),
         }
     }

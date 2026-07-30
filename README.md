@@ -121,7 +121,7 @@ for further inspection, but it will never be 100% accurate.
 | Aspect | Decision |
 |---|---|
 | **Adversary** | Author of a potentially-malicious executable trying to evade *static* detection (packing, obfuscation, import hiding). |
-| **In scope** | PE (Windows) first; ELF (Linux) second; Mach-O stubbed. Feature extraction + a rule/score-based maliciousness estimate. |
+| **In scope** | PE (Windows) first; ELF (Linux) second. Feature extraction, rule-based capability findings, and an explicit statement of where static evidence runs out. |
 | **Out of scope** | Executing samples, kernel/driver analysis, full decompilation, network C2 interaction. |
 | **Trust boundary** | Every input byte is **untrusted**. The parser must never panic or read out of bounds on hostile input — this is a security property we test. |
 
@@ -139,15 +139,24 @@ for further inspection, but it will never be 100% accurate.
 | **M5** | String + IOC extraction (URLs, IPs, registry keys) | recover embedded strings |
 | **M6** | Format-abstraction layer → add ELF | multi-platform abstraction |
 | **M7** | Control-Flow Graph for a function → Graphviz | CFG construction + viz |
-| **M8** | Machine-readable JSON report (+ optional HTML) | machine-readable reports |
+| **M8** | Machine-readable JSON report | machine-readable reports |
 | **M9** | Plugin architecture (analyzers as plugins) | extensibility |
 | **M10** | **Evaluation:** run over labeled dataset → precision/recall/F1, ROC/AUC vs. baseline; document false positives + limits |
 
-**Status:** M0–M8 complete — PE parser, entropy, imports, suspicious-API rules,
-strings + IOCs, a **format-abstraction layer with ELF support** (one `sma`
-analyzes both Windows PE and Linux ELF), a **disassembler + control-flow graph**
-(`sma -d`, text or Graphviz DOT, built on Capstone), and a **machine-readable JSON
-report** (`sma --json`) for the evaluation pipeline. M9 (plugin architecture) is next.
+**Status:** M0–M8 complete. PE and ELF parsers, per-section entropy, imports,
+suspicious-API rules, strings + IOCs, a disassembler and control-flow graph built
+on Capstone, and a machine-readable JSON report for the evaluation pipeline.
+
+Beyond the original M1–M8 the tool now also resolves **imports to the code that
+calls them** — a call target is reported as `KERNEL32!VirtualAllocEx`, not as a
+bare address — surfaces the **PE metadata** that answers research question 7
+(build timestamp, subsystem, mitigations, exports, TLS callbacks, signature
+presence, overlay), and closes every report with a **`limits` section** stating
+what static analysis could not resolve in that specific sample and which
+technique takes over. That last part is research question 15 answered per-file
+instead of in the abstract.
+
+M9 (plugin architecture) is next.
 
 ---
 
@@ -187,90 +196,144 @@ built binary lands at `target/release/sma`.)
 > `sma` for Windows and Linux and attaches them to a GitHub Release
 > (see `.github/workflows/release.yml`).
 
-### Modes
+### Verbs
 
-One binary, several analysis modes (scan and disassemble are implemented; debug
-is declared so the interface is stable as the project grows):
+The interface follows the three questions a static analyst actually asks, in
+order: *what is this and what stands out?* → *where is the interesting code?* →
+*what does that code do?* One verb per question, one artifact per verb.
 
 ```
-sma [MODE] <path-to-exe> [options]
+sma <verb> <file> [options]
+sma <file>                       same as: sma scan <file>
 
-  -s, --scan           static report (default): headers, entropy, imports,
-                       capabilities, strings/IOCs
-  -d, --disassemble    build a function's control-flow graph (CFG)
-  -b, --debug          dynamic / debug analysis                 [planned: future]
-  -h, --help           show help
+  scan       triage report: headers, sections + entropy, imports, capabilities,
+             strings/IOCs, and the limits of what static analysis can see here
+  functions  inventory of discovered functions (entry point, exports, TLS
+             callbacks, call targets) and the APIs each one reaches
+  cfg        control-flow graph of one function
+  disasm     flat instruction listing, like objdump -d
+  hex        a window of raw bytes
 
-scan options:
-  -f, --full           also print the COMPLETE hex of the headers and every
-                       section to stdout (massive; redirect it to a file)
-      --dump-sections <dir>   write per-section hex files (see below)
+scan / functions options:
+      --json               machine-readable output instead of the human report
 
-disassemble options:
-      --addr <hex>     function start address (default: the entry point)
-      --dot            emit Graphviz DOT instead of a text listing
+cfg options:
+      --addr <hex>         function to graph (default: the entry point)
+      --dot                emit Graphviz DOT instead of a text listing
+
+disasm options:
+      --addr <hex>         start here instead of listing whole sections
+      --count <n>          stop after n instructions
+      --section <name>     restrict to one section
+
+hex options:
+      --at <hex>           start at a virtual address (RVA)
+      --section <name>     start at a section
+      --headers            the header region
+      --len <n>            how many bytes (default 256)
+
+  -h, --help    -V, --version
 ```
 
-### Examples
+A flag belongs to exactly one verb. Using it under the wrong one is an error, not
+a silent no-op — `sma scan f.exe --dot` tells you `--dot` belongs to `cfg`.
+
+### A typical session
 
 ```sh
-sma -s "C:/Windows/System32/notepad.exe"                 # or just: sma <path>
-sma "C:/Windows/explorer.exe" | grep -A20 '^capabilities' # pipe like any Unix tool
-sma "C:/Windows/System32/cmd.exe" > data/cmd.exe.analysis.txt     # save a report
-sma --json "C:/Windows/System32/notepad.exe" > data/notepad.json  # machine-readable (M8)
+sma scan sample.exe                    # what is this, and what stands out?
+sma functions sample.exe               # where is the interesting code?
+sma cfg sample.exe --addr 0x24c0       # what does that function do?
 
-# -f appends the ENTIRE hex of every section to the report. Redirect to a file:
-sma -s -f "C:/path/to/big.exe" > output/big.full.txt      # e.g. 223 MB exe -> ~1 GB text
-
-# -d builds a function's control-flow graph (default: the entry point).
-sma -d "C:/Windows/System32/cmd.exe"                      # readable text CFG (one function)
-sma -d "C:/Windows/System32/cmd.exe" --dot > cfg.dot      # Graphviz; dot -Tpng cfg.dot -o cfg.png
-sma -d "C:/Windows/System32/cmd.exe" --addr 0x27c54       # a specific function
-
-# --all linear-disassembles the WHOLE program (every function). Redirect to a file:
-sma -d --all "C:/path/to/app.exe" > output/app.disassembled.txt   # can be multi-GB
-
-# --calls lists the program's call targets (function RVAs + how often called),
-# so you can jump to any one with --addr:
-sma -d --calls "C:/path/to/app.exe" > output/app.calls.txt
-sma -d --addr 0x509e900 "C:/path/to/app.exe"   # inspect one function from that list
+sma cfg sample.exe --addr 0x24c0 --dot > f.dot && dot -Tpng f.dot -o f.png
+sma scan sample.exe --json > data/sample.json     # for the evaluation pipeline
+sma disasm sample.exe --addr 0x24c0 --count 40    # a window, not the whole program
+sma hex sample.exe --at 0x24c0 --len 128          # the bytes behind it
+sma hex sample.exe --headers                      # the header region
 ```
 
-The CFG (`-d`) shows *one function* with its branch/loop structure; `--all` shows
-*every* instruction in every executable section, flat (like `objdump -d`).
+`functions` is the bridge between the report and the disassembly: it lists every
+address worth looking at, alongside the imported APIs each one reaches, so you
+pick a target instead of guessing one.
 
-The full hex is *streamed* (constant memory), so even a 200 MB+ binary dumps in a
-few seconds when redirected to a file. Piping it through another program in a
-Git-Bash/MSYS shell is much slower (small pipe buffers) — redirect to a file.
-
-**Full hex, per section** — stdout stays the generalized report; the raw bytes go
-to separate files (one per section + a headers file), each with that section's
-specifics (entropy, flags, sizes, RVA) followed by its **complete** hex dump:
-
-```sh
-sma <path> --dump-sections output/ > output/<name>.analysis.txt
+```
+  rva          calls  label                reaches (imported APIs)
+  0x000019c0       -  [entry]
+  0x000024c0       3  -                    KERNEL32!VirtualAllocEx, KERNEL32!WriteProcessMemory
+  0x00002310      17  [export: Install]    ADVAPI32!RegCreateKeyExW, ADVAPI32!RegSetValueExW
 ```
 
-Writes `output/<name>.headers.txt` and `output/<name>.section-NN-<name>.txt`.
-Note: a section's hex file is ~10× its raw size, so dumping a very large binary's
-`.text` (e.g. an Electron app) can produce a multi-hundred-MB file.
+That same resolution runs inside `cfg` and `disasm`, so a call reads as behaviour
+rather than as an address:
+
+```
+    0x00001368  call qword ptr [rip + 0x29079]   ; KERNEL32!EventWriteTransfer
+```
 
 ### What the scan report shows
 
-Five parts, one per milestone: PE header summary (M1), per-section **entropy** +
-packing results (M2), **imports** (M3), **capability findings** with severities
-(M4), and **strings + IOCs** (M5). A finding is a *reason to look closer*, never definitive
-— benign software trips these rules constantly.
+PE/ELF header summary (M1); **build metadata** — timestamp, subsystem,
+mitigations, signature, TLS callbacks, packer hints; per-section **entropy** +
+packing assessment (M2); **imports** (M3) and **exports** (including forwarders);
+**capability findings** with severities (M4); **strings + IOCs** (M5); any
+**overlay** appended past the last section; and finally the **limits** section.
+
+A finding is a *reason to look closer*, never definitive — benign software trips
+these rules constantly, which is the point the project is making.
+
+### The `limits` section
+
+Every report ends by naming what static analysis could **not** resolve in that
+sample, the evidence for saying so, and which technique answers it instead:
+
+```
+limits         : 2 thing(s) static analysis cannot resolve here
+  cannot see   : the real import table
+    because    : 3 declared import(s) alongside packed section(s) [.text] -- too few to
+                 account for a working program, so the rest are resolved at runtime
+    next step  : run to the original entry point, then dump the unpacked image from memory
+```
+
+This is deliberately **not** a verdict. It never scores or ranks maliciousness;
+it reports where the evidence stops. Static analysis being *indicative, not
+definitive* is the thesis, so the tool states its own boundary rather than
+hiding it.
 
 ---
 
 ## Layout
 
 ```
-static_malware_analysus/
-  README.md         ← you are here
-  src/              MY implementation (Rust)
-  Cargo.toml
+SMA/
+  README.md          ← you are here
+  Cargo.toml         one dependency: capstone
+  src/               the implementation (Rust)
+
+    main.rs          plumbing only: parse args, read file, dispatch one view
+    cli.rs           verbs, flags, and the rule that a flag belongs to one verb
+    lib.rs           module list + the PE/ELF format sniffer
+
+    reader.rs        bounds-checked little-endian reads; the trust boundary
+    error.rs         every parse failure as a value, never a panic
+    binary.rs        the format-neutral model (Binary/Section/Import/Export)
+    pe.rs            PE/COFF: DOS → NT headers → sections → data directories
+    elf.rs           ELF32/64: header → section table → dynamic symbols
+    imports.rs       PE import table, including each function's IAT slot
+    exports.rs       PE export directory (with forwarders) + TLS callbacks
+
+    entropy.rs       Shannon entropy over a byte range
+    packers.rs       packer identification from section names
+    strings.rs       ASCII/UTF-16 extraction + IOC classification
+    rules.rs         suspicious-API capability rules
+    limits.rs        what static analysis could not resolve, and what takes over
+
+    symbols.rs       names for addresses: IAT lookup + import-thunk following
+    cfg.rs           Capstone disassembly, control-flow graph, linear sweep
+    functions.rs     the function inventory and the APIs each one reaches
+
+    report.rs        the human report
+    json.rs          the machine-readable report
+    hexdump.rs       hex output and window resolution
 ```
 
 ## Software Artifact
@@ -289,7 +352,8 @@ The implementation exists to answer the research question through controlled exp
 
 ## Artifical Intelligence Usage
 
-This project includes the use of Artifical Intelligence. Claude Opus 4.8 was the primary AI model used to generate aspects of the program
+This project includes the use of Artifical Intelligence. Claude (Opus 4.8, and Opus 5 for later
+revisions) was the primary AI model used to generate aspects of the program
 such as the projects scaffolding, README.md (specific parts), and some code. Claude was also the model responsible for the learning
 aspect of the project. Additionally, Claude was used to push the
 project to Github.
@@ -298,12 +362,15 @@ project to Github.
 
 These are some additional questions to consider. Not necessarily for research purposes, but for the artifact and the reader themselves.
 
-- How many lines of Rust?
-- How many modules?
-- How many executable formats?
-- How many APIs are recognized?
-- How many heuristics?
-- How many IOC types?
-- What parser architecture?
-- What crates are used?
-- Performance?
+| Question | As of this revision |
+|---|---|
+| How many lines of Rust? | ~4,600 across `src/` |
+| How many modules? | 21 |
+| How many unit tests? | 80 |
+| How many executable formats? | 2 (PE, ELF) |
+| How many APIs are recognized? | 67, across 9 capability rules |
+| How many heuristics? | 9 capability rules + 8 `limits` rules + 13 packer signatures |
+| How many IOC types? | 4 (URL, IPv4, registry key, file path) |
+| What parser architecture? | Hand-rolled, bounds-checked `ByteReader`; every parse error is a value, never a panic |
+| What crates are used? | One: `capstone` (disassembly). Parsers, CLI, JSON, and graph code are std-only, on purpose |
+| Performance? | Milliseconds per file; 400 System32 binaries scan without a single failure |
