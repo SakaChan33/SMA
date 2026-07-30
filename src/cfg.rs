@@ -1,11 +1,12 @@
 use crate::binary::Binary;
+use crate::symbols::{CallTarget, Symbols};
 use capstone::prelude::*;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{self, Write};
 
 // How a single instruction affects control flow.
 #[derive(Clone, Copy, PartialEq)]
-enum Flow {
+pub(crate) enum Flow {
     Normal,   // falls through to the next instruction
     Call,     // calls a subroutine, then falls through (callee is another function)
     Return,   // ends the function path (ret)
@@ -41,6 +42,18 @@ pub fn build(file: &[u8], bin: &Binary, start: Option<u64>) -> Result<Cfg, Strin
         x86_mode(bin).ok_or_else(|| format!("disassembly supports x86/x86-64 only (this is {})", bin.arch))?;
 
     let func = start.unwrap_or(bin.entry_point);
+
+    // A declared entry point of 0 means the image has none: resource-only DLLs
+    // and some .NET stubs look like this. Say so, rather than reporting the
+    // generic "no section contains address 0x0" and leaving the user to work
+    // out that the address came from us, not from them.
+    if func == 0 && start.is_none() {
+        return Err(
+            "this image declares no entry point (RVA 0), so there is no default function to graph.\n\
+             pick one with --addr, or run `sma functions` to list the addresses worth looking at"
+                .to_string(),
+        );
+    }
 
     // Find the section holding the start address, and borrow its on-disk bytes.
     let sec = bin
@@ -167,7 +180,7 @@ pub fn build(file: &[u8], bin: &Binary, start: Option<u64>) -> Result<Cfg, Strin
 }
 
 // Pick the Capstone x86 mode for this binary (None if it isn't x86/x86-64).
-fn x86_mode(bin: &Binary) -> Option<arch::x86::ArchMode> {
+pub(crate) fn x86_mode(bin: &Binary) -> Option<arch::x86::ArchMode> {
     if bin.arch.contains("x86-64") || bin.arch.contains("AMD64") {
         Some(arch::x86::ArchMode::Mode64)
     } else if bin.arch.contains("x86") || bin.arch.contains("I386") {
@@ -177,130 +190,163 @@ fn x86_mode(bin: &Binary) -> Option<arch::x86::ArchMode> {
     }
 }
 
-// `-d --all`: LINEAR disassembly of every executable section, top to bottom --
-// the entire program's code, not just one function. Streamed instruction-by-
-// instruction (bounded memory) so it works regardless of file size, even a
-// 172 MB `.text`. Undecodable bytes are emitted as `.byte` and skipped, the way
-// objdump prints `(bad)`. Returns the instruction count.
-pub fn disassemble_all<W: Write>(file: &[u8], bin: &Binary, w: &mut W) -> io::Result<u64> {
+// What `sma disasm` should cover.
+#[derive(Debug, Default, Clone)]
+pub struct DisasmOpts<'a> {
+    // Start here instead of walking whole sections.
+    pub addr: Option<u64>,
+    // Stop after this many instructions. None = no limit.
+    pub count: Option<usize>,
+    // Restrict to one section by name.
+    pub section: Option<&'a str>,
+}
+
+// `sma disasm`: LINEAR disassembly, top to bottom -- the whole program's code by
+// default, not just one function. Streamed instruction-by-instruction (bounded
+// memory) so any file size works, even a 172 MB `.text`. Undecodable bytes are
+// emitted as `.byte (bad)` the way objdump does. Returns the instruction count.
+//
+// Linear sweeping is the honest-but-dumb strategy: it will happily decode data
+// as instructions. `sma cfg` follows control flow instead and is what you want
+// once you know which address matters.
+pub fn disassemble<W: Write>(
+    file: &[u8],
+    bin: &Binary,
+    w: &mut W,
+    opts: &DisasmOpts,
+    syms: Option<&Symbols>,
+) -> io::Result<u64> {
     let mode = x86_mode(bin).ok_or_else(|| {
         io::Error::other(format!("disassembly supports x86/x86-64 only (this is {})", bin.arch))
     })?;
-    let cs = Capstone::new()
-        .x86()
-        .mode(mode)
-        .syntax(arch::x86::ArchSyntax::Intel)
-        .detail(false)
-        .build()
-        .map_err(|e| io::Error::other(format!("capstone init failed: {e}")))?;
+    let cs = new_capstone(mode)?;
 
-    let mut count: u64 = 0;
-    for sec in bin.sections.iter().filter(|s| s.is_executable()) {
+    let mut total: u64 = 0;
+    let limit = opts.count.unwrap_or(usize::MAX);
+
+    // --addr narrows to one window inside whichever section holds the address.
+    if let Some(start) = opts.addr {
+        let sec = bin
+            .section_at(start)
+            .ok_or_else(|| io::Error::other(format!("no section contains address {start:#x}")))?;
+        let bytes = sec.on_disk_bytes(file);
+        let delta = (start - sec.virtual_addr) as usize;
+        if delta >= bytes.len() {
+            return Err(io::Error::other(format!(
+                "address {start:#x} has no bytes on disk (it lands in the part of '{}' that only exists once loaded)",
+                sec.name
+            )));
+        }
+        let name = section_label(sec);
+        writeln!(w, "== {name} from {start:#x} ==\n")?;
+        total += sweep(&cs, &bytes[delta..], start, limit, w, syms)?;
+        return Ok(total);
+    }
+
+    let wanted = |s: &&crate::binary::Section| -> bool {
+        s.is_executable()
+            && match opts.section {
+                Some(n) => s.name == n || s.name.eq_ignore_ascii_case(n),
+                None => true,
+            }
+    };
+
+    let mut matched_any = false;
+    for sec in bin.sections.iter().filter(wanted) {
+        matched_any = true;
         let bytes = sec.on_disk_bytes(file);
         if bytes.is_empty() {
             continue;
         }
-        let base = sec.virtual_addr;
-        let name = if sec.name.is_empty() { "(unnamed)" } else { &sec.name };
-        writeln!(w, "\n== section {name}  (addr {base:#x}, {} bytes) ==", bytes.len())?;
+        let name = section_label(sec);
+        writeln!(w, "\n== section {name}  (addr {:#x}, {} bytes) ==", sec.virtual_addr, bytes.len())?;
+        let remaining = limit.saturating_sub(total as usize);
+        if remaining == 0 {
+            break;
+        }
+        total += sweep(&cs, bytes, sec.virtual_addr, remaining, w, syms)?;
+    }
 
-        // Decode in batches so we never hold the whole section's instructions in
-        // memory at once.
-        let mut off = 0usize;
-        while off < bytes.len() {
-            let addr = base + off as u64;
-            let insns = cs
-                .disasm_count(&bytes[off..], addr, 8192)
-                .map_err(|e| io::Error::other(format!("capstone: {e}")))?;
-            if insns.is_empty() {
-                // A byte we can't decode (data, padding, or a truncated tail).
-                writeln!(w, "{addr:#012x}  {:02x}          .byte (bad)", bytes[off])?;
-                off += 1;
-                continue;
+    if !matched_any {
+        if let Some(n) = opts.section {
+            return Err(io::Error::other(format!("no executable section named '{n}'")));
+        }
+        return Err(io::Error::other("this binary has no executable section with bytes on disk"));
+    }
+    Ok(total)
+}
+
+// Decode `bytes` starting at virtual address `base`, printing up to `limit`
+// instructions. Batched so the whole section's instructions never sit in memory
+// at once.
+fn sweep<W: Write>(
+    cs: &Capstone,
+    bytes: &[u8],
+    base: u64,
+    limit: usize,
+    w: &mut W,
+    syms: Option<&Symbols>,
+) -> io::Result<u64> {
+    let mut count: u64 = 0;
+    let mut off = 0usize;
+    while off < bytes.len() && (count as usize) < limit {
+        let addr = base + off as u64;
+        let batch = 8192.min(limit - count as usize);
+        let insns = cs
+            .disasm_count(&bytes[off..], addr, batch)
+            .map_err(|e| io::Error::other(format!("capstone: {e}")))?;
+        if insns.is_empty() {
+            // A byte we can't decode: data, padding, or a truncated tail.
+            writeln!(w, "{addr:#012x}  {:02x}          .byte (bad)", bytes[off])?;
+            off += 1;
+            continue;
+        }
+        for insn in insns.iter() {
+            let m = insn.mnemonic().unwrap_or("");
+            let o = insn.op_str().unwrap_or("");
+            let note = call_annotation(m, o, insn.address() + insn.bytes().len() as u64, syms);
+            match (o.is_empty(), note) {
+                (true, _) => writeln!(w, "{:#012x}  {m}", insn.address())?,
+                (false, Some(n)) => writeln!(w, "{:#012x}  {m} {o}{n}", insn.address())?,
+                (false, None) => writeln!(w, "{:#012x}  {m} {o}", insn.address())?,
             }
-            for insn in insns.iter() {
-                let m = insn.mnemonic().unwrap_or("");
-                let o = insn.op_str().unwrap_or("");
-                if o.is_empty() {
-                    writeln!(w, "{:#012x}  {m}", insn.address())?;
-                } else {
-                    writeln!(w, "{:#012x}  {m} {o}", insn.address())?;
-                }
-                off += insn.bytes().len();
-                count += 1;
-            }
+            off += insn.bytes().len();
+            count += 1;
         }
     }
     Ok(count)
 }
 
-// `-d --calls`: the program's call graph as a list. Linear-sweeps every
-// executable section, collects every DIRECT `call` target (an indirect
-// `call rax` has no static target), and prints each unique target address with
-// how many times it's called -- i.e. a list of the program's functions, sorted
-// by address. Each in-code target can then be inspected with `-d --addr <rva>`.
-pub fn list_calls<W: Write>(file: &[u8], bin: &Binary, w: &mut W) -> io::Result<u64> {
-    let mode = x86_mode(bin).ok_or_else(|| {
-        io::Error::other(format!("disassembly supports x86/x86-64 only (this is {})", bin.arch))
-    })?;
-    let cs = Capstone::new()
+// `; KERNEL32!VirtualAlloc` for a call whose target resolves to an import.
+// This is the difference between reading addresses and reading behaviour.
+fn call_annotation(mnem: &str, ops: &str, next_rva: u64, syms: Option<&Symbols>) -> Option<String> {
+    let syms = syms?;
+    if !matches!(classify(mnem), Flow::Call | Flow::Jump) {
+        return None;
+    }
+    match syms.classify_call(ops, next_rva) {
+        CallTarget::Import(api) => Some(format!("        ; {api}")),
+        CallTarget::Code(t) => syms.label_at(t).map(|l| format!("        ; {}", l.text())),
+        CallTarget::Unknown => None,
+    }
+}
+
+fn section_label(s: &crate::binary::Section) -> &str {
+    if s.name.is_empty() {
+        "(unnamed)"
+    } else {
+        &s.name
+    }
+}
+
+pub(crate) fn new_capstone(mode: arch::x86::ArchMode) -> io::Result<Capstone> {
+    Capstone::new()
         .x86()
         .mode(mode)
         .syntax(arch::x86::ArchSyntax::Intel)
         .detail(false)
         .build()
-        .map_err(|e| io::Error::other(format!("capstone init failed: {e}")))?;
-
-    // BTreeMap keeps targets sorted by address for free.
-    let mut targets: std::collections::BTreeMap<u64, u64> = std::collections::BTreeMap::new();
-    let mut call_sites: u64 = 0;
-
-    for sec in bin.sections.iter().filter(|s| s.is_executable()) {
-        let bytes = sec.on_disk_bytes(file);
-        if bytes.is_empty() {
-            continue;
-        }
-        let base = sec.virtual_addr;
-        let mut off = 0usize;
-        while off < bytes.len() {
-            let addr = base + off as u64;
-            let insns = cs
-                .disasm_count(&bytes[off..], addr, 8192)
-                .map_err(|e| io::Error::other(format!("capstone: {e}")))?;
-            if insns.is_empty() {
-                off += 1;
-                continue;
-            }
-            for insn in insns.iter() {
-                let m = insn.mnemonic().unwrap_or("");
-                if m == "call" || m == "lcall" {
-                    if let Some(t) = parse_target(insn.op_str().unwrap_or("")) {
-                        *targets.entry(t).or_insert(0) += 1;
-                        call_sites += 1;
-                    }
-                }
-                off += insn.bytes().len();
-            }
-        }
-    }
-
-    let is_in_code = |addr: u64| {
-        bin.sections.iter().any(|s| {
-            s.is_executable() && (s.virtual_addr..s.virtual_addr + s.virtual_size.max(s.file_size)).contains(&addr)
-        })
-    };
-
-    writeln!(w, "call graph: {} unique target(s), {call_sites} direct call site(s)\n", targets.len())?;
-    writeln!(w, "  {:<14}  {:>9}   where", "target (RVA)", "call(s)")?;
-    for (addr, count) in &targets {
-        let note = if is_in_code(*addr) {
-            "in code  ->  sma -d --addr <this rva>"
-        } else {
-            "outside code (import thunk / data)"
-        };
-        writeln!(w, "  {addr:#012x}  {count:>9}   {note}")?;
-    }
-    Ok(targets.len() as u64)
+        .map_err(|e| io::Error::other(format!("capstone init failed: {e}")))
 }
 
 // Decode exactly one instruction at `addr` and classify its control flow.
@@ -328,7 +374,7 @@ fn decode_one(cs: &Capstone, sbytes: &[u8], sec_base: u64, addr: u64) -> Option<
 
 // Classify an x86 mnemonic. (All mnemonics starting with 'j' except "jmp" are
 // conditional jumps; "loop*" branch conditionally too.)
-fn classify(mnem: &str) -> Flow {
+pub(crate) fn classify(mnem: &str) -> Flow {
     if mnem == "ret" || mnem == "retn" || mnem == "retf" || mnem.starts_with("iret") {
         Flow::Return
     } else if mnem == "call" || mnem == "lcall" {
@@ -344,7 +390,7 @@ fn classify(mnem: &str) -> Flow {
 
 // A direct branch/call renders its target as a bare hex address in the operand
 // string (e.g. "0x401020"); indirect ones (a register/memory) do not parse.
-fn parse_target(ops: &str) -> Option<u64> {
+pub(crate) fn parse_target(ops: &str) -> Option<u64> {
     ops.trim().strip_prefix("0x").and_then(|h| u64::from_str_radix(h, 16).ok())
 }
 
@@ -361,12 +407,18 @@ impl Cfg {
     }
 
     // Readable text listing: each block, its instructions, and its out-edges.
-    pub fn to_text<W: Write>(&self, w: &mut W) -> io::Result<()> {
+    // `syms` turns `call 0x401234` into `call 0x401234  ; KERNEL32!VirtualAlloc`,
+    // which is the difference between reading addresses and reading behaviour.
+    pub fn to_text<W: Write>(&self, w: &mut W, syms: Option<&Symbols>) -> io::Result<()> {
         let index: BTreeMap<u64, usize> =
             self.blocks.iter().enumerate().map(|(i, b)| (b.start, i)).collect();
+        let title = syms
+            .and_then(|s| s.label_at(self.func))
+            .map(|l| format!("  {}", l.text()))
+            .unwrap_or_default();
         writeln!(
             w,
-            "function {:#x}  ({} instruction(s), {} basic block(s))\n",
+            "function {:#x}{title}  ({} instruction(s), {} basic block(s))\n",
             self.func,
             self.instrs.len(),
             self.blocks.len()
@@ -375,7 +427,11 @@ impl Cfg {
             let tag = if b.start == self.func { "  (entry)" } else { "" };
             writeln!(w, "[block {i}] {:#x}{tag}", b.start)?;
             for &a in &b.addrs {
-                writeln!(w, "    {:#010x}  {}", a, self.instrs[&a].text)?;
+                let ins = &self.instrs[&a];
+                match self.annotate(ins, syms) {
+                    Some(note) => writeln!(w, "    {:#010x}  {:<38} ; {note}", a, ins.text)?,
+                    None => writeln!(w, "    {:#010x}  {}", a, ins.text)?,
+                }
             }
             if b.succ.is_empty() {
                 writeln!(w, "    -> (end)")?;
@@ -398,19 +454,47 @@ impl Cfg {
         Ok(())
     }
 
+    // An API name for a call/jump that reaches an import, or a label for one
+    // that reaches a known function.
+    fn annotate(&self, ins: &Instr, syms: Option<&Symbols>) -> Option<String> {
+        let syms = syms?;
+        if !matches!(ins.flow, Flow::Call | Flow::Jump) {
+            return None;
+        }
+        let ops = ins.text.split_once(' ').map(|(_, o)| o).unwrap_or("");
+        match syms.classify_call(ops, ins.addr + ins.size) {
+            CallTarget::Import(api) => Some(api),
+            CallTarget::Code(t) => syms.label_at(t).map(|l| l.text()),
+            CallTarget::Unknown => None,
+        }
+    }
+
     // Graphviz DOT: one box per block (its disassembly), edges labeled. Render with
-    //   sma -d <file> --dot > f.dot && dot -Tpng f.dot -o f.png
-    pub fn to_dot<W: Write>(&self, w: &mut W) -> io::Result<()> {
+    //   sma cfg <file> --dot > f.dot && dot -Tpng f.dot -o f.png
+    pub fn to_dot<W: Write>(&self, w: &mut W, syms: Option<&Symbols>) -> io::Result<()> {
         let starts: BTreeSet<u64> = self.blocks.iter().map(|b| b.start).collect();
+        let title = syms
+            .and_then(|s| s.label_at(self.func))
+            .map(|l| format!("  {}", l.text()))
+            .unwrap_or_default();
         writeln!(w, "digraph cfg {{")?;
         writeln!(w, "  labelloc=\"t\";")?;
-        writeln!(w, "  label=\"CFG of function {:#x}\";", self.func)?;
+        writeln!(w, "  label=\"CFG of function {:#x}{}\";", self.func, dot_escape(&title))?;
         writeln!(w, "  node [shape=box, fontname=\"monospace\", fontsize=10];")?;
 
         for b in &self.blocks {
             let mut label = format!("{:#x}\\l", b.start);
             for &a in &b.addrs {
-                label.push_str(&format!("{:#x}  {}\\l", a, dot_escape(&self.instrs[&a].text)));
+                let ins = &self.instrs[&a];
+                match self.annotate(ins, syms) {
+                    Some(note) => label.push_str(&format!(
+                        "{:#x}  {}  ; {}\\l",
+                        a,
+                        dot_escape(&ins.text),
+                        dot_escape(&note)
+                    )),
+                    None => label.push_str(&format!("{:#x}  {}\\l", a, dot_escape(&ins.text))),
+                }
             }
             // Highlight the entry block so the graph reads top-down.
             let style = if b.start == self.func { ", style=filled, fillcolor=\"#d0e0ff\"" } else { "" };
@@ -461,6 +545,9 @@ mod tests {
             image_base: 0,
             sections: vec![sec],
             imports: vec![],
+            exports: vec![],
+            overlay: None,
+            pe_meta: None,
             strings: StringScan::default(),
         };
         (code.to_vec(), bin)

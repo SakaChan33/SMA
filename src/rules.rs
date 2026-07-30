@@ -130,7 +130,7 @@ pub fn assess_imports(imports: &[Import]) -> Vec<Finding> {
     // Flatten every imported function name once, lowercased, for matching.
     let names: Vec<String> = imports
         .iter()
-        .flat_map(|i| i.functions.iter())
+        .flat_map(|i| i.names())
         .map(|f| f.to_ascii_lowercase())
         .collect();
 
@@ -168,7 +168,7 @@ mod tests {
     fn imp(dll: &str, funcs: &[&str]) -> Import {
         Import {
             dll: dll.into(),
-            functions: funcs.iter().map(|s| s.to_string()).collect(),
+            functions: funcs.iter().copied().map(crate::binary::ImportedFn::named).collect(),
         }
     }
 
