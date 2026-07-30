@@ -48,7 +48,19 @@ fn run(command: &Command) -> Result<(), String> {
     let path = command_path(command);
 
     // Every byte from here on is UNTRUSTED input.
-    let bytes = std::fs::read(path).map_err(|e| format!("error: cannot read {path}: {e}"))?;
+    let bytes = std::fs::read(path).map_err(|e| {
+        // A path that is really an address means the flag was left off. Only
+        // said once the read has actually failed, so a file genuinely named
+        // like an address still works.
+        match cli::address_flag(verb_of(command)) {
+            Some(flag) if cli::looks_like_address(path) => format!(
+                "error: cannot read {path}: {e}\n       \
+                 that looks like an address -- it belongs to {flag}: sma {} {flag} {path} <file>",
+                verb_of(command)
+            ),
+            _ => format!("error: cannot read {path}: {e}"),
+        }
+    })?;
     let bin = parse(&bytes).map_err(|e| format!("parse error: {e}"))?;
 
     let stdout = io::stdout();
