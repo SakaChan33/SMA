@@ -8,7 +8,7 @@
 
 use static_malware_analysis::cli::{self, Command, Invocation};
 use static_malware_analysis::symbols::Symbols;
-use static_malware_analysis::{cfg, functions, hexdump, json, parse, report, rules};
+use static_malware_analysis::{cfg, functions, hexdump, json, parse, report};
 use std::io::{self, Write};
 use std::process::ExitCode;
 
@@ -68,8 +68,7 @@ fn run(command: &Command) -> Result<(), String> {
 
     let result = match command {
         Command::Scan { json: true, .. } => {
-            let findings = rules::assess_imports(&bin.imports);
-            write!(w, "{}", json::report(path, bytes.len(), &bin, &findings)).map_err(Into::into)
+            write!(w, "{}", json::report(path, bytes.len(), &bin)).map_err(Into::into)
         }
         Command::Scan { .. } => report::write(&mut w, path, bytes.len(), &bin).map_err(Into::into),
 

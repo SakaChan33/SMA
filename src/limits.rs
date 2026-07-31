@@ -12,7 +12,6 @@
 // always "static analysis stops here", never "this is malware".
 
 use crate::binary::Binary;
-use crate::rules;
 use std::io::{self, Write};
 
 pub struct Limit {
@@ -26,6 +25,47 @@ pub struct Limit {
 
 // Few enough imports that the table cannot describe a real program's behaviour.
 const SPARSE_IMPORTS: usize = 10;
+
+// The shortest list of functions whose presence means the import table is
+// incomplete *by construction*: everything reached through them is resolved at
+// runtime and never appears in any header.
+//
+// This is deliberately not a capability taxonomy, and it must never grow into
+// one. SMA lists the binary's own import table without consulting any
+// dictionary, precisely so nothing can be filtered out by a gap in a table we
+// maintain. These six names gate one sentence in this section -- they decide
+// nothing about what the analyst is shown.
+//
+// Matched by prefix, so LoadLibraryExW and LoadLibraryW both count. That
+// mattered: an earlier rules engine appended only "A"/"W" and so missed
+// LoadLibraryExW, which is the spelling real code actually uses.
+const API_RESOLVERS: &[&str] = &[
+    "getprocaddress",
+    "loadlibrary",
+    "ldrgetprocedureaddress",
+    "ldrloaddll",
+    "dlsym",
+    "dlopen",
+];
+
+// The resolvers this binary imports, named, or None.
+fn imported_resolvers(bin: &Binary) -> Option<String> {
+    let mut found: Vec<String> = Vec::new();
+    for imp in &bin.imports {
+        for name in imp.names() {
+            let lower = name.to_ascii_lowercase();
+            if API_RESOLVERS.iter().any(|r| lower.starts_with(r)) && !found.iter().any(|f| f == name)
+            {
+                found.push(name.to_string());
+            }
+        }
+    }
+    if found.is_empty() {
+        return None;
+    }
+    found.sort();
+    Some(found.join(", "))
+}
 
 pub fn assess(bin: &Binary, indirect_ratio: Option<(u64, u64)>) -> Vec<Limit> {
     let mut limits = Vec::new();
@@ -102,16 +142,18 @@ pub fn assess(bin: &Binary, indirect_ratio: Option<(u64, u64)>) -> Vec<Limit> {
         });
     }
 
-    // Declaring the resolver pair means the interesting API names may never
-    // appear in the table at all.
-    let findings = rules::assess_imports(&bin.imports);
-    if findings.iter().any(|f| f.capability.contains("Runtime API resolution")) {
+    // Importing a resolver means the interesting API names may never appear in
+    // the table at all. This is a statement about what the import listing can
+    // show, not about whether the program is doing anything wrong with it --
+    // every dynamically-linked program on the system imports these.
+    if let Some(found) = imported_resolvers(bin) {
         limits.push(Limit {
-            obscured: "APIs resolved by name at runtime",
-            evidence: "LoadLibrary/GetProcAddress (or dlopen/dlsym) are imported: any API reached \
-                       through them is absent from the import table by construction"
-                .to_string(),
-            next_step: "breakpoint GetProcAddress/dlsym and log what it is asked for",
+            obscured: "any API resolved by name at runtime",
+            evidence: format!(
+                "{found} imported: whatever is reached through a resolver never appears in the \
+                 import table, so the listing above is a floor, not a ceiling"
+            ),
+            next_step: "breakpoint the resolver and log the names it is asked for",
         });
     }
 

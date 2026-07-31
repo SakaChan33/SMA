@@ -14,7 +14,6 @@ pub mod packers;
 pub mod pe;
 pub mod reader;
 pub mod report;
-pub mod rules;
 pub mod strings;
 pub mod symbols;
 

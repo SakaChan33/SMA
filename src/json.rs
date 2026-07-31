@@ -1,5 +1,4 @@
 use crate::binary::{Binary, Format};
-use crate::rules::Finding;
 
 // Escape a string for use inside a JSON string literal (RFC 8259).
 fn esc(s: &str) -> String {
@@ -36,7 +35,7 @@ fn arr(items: Vec<String>) -> String {
 // Build the full JSON report for one analyzed binary. Numbers stay numeric
 // (sizes, offsets, addresses, counts) so a consumer can threshold/compare them;
 // entropy is a float; severities/kinds are strings.
-pub fn report(path: &str, size: usize, bin: &Binary, findings: &[Finding]) -> String {
+pub fn report(path: &str, size: usize, bin: &Binary) -> String {
     let format = match bin.format {
         Format::Pe => "PE",
         Format::Elf => "ELF",
@@ -82,12 +81,32 @@ pub fn report(path: &str, size: usize, bin: &Binary, findings: &[Finding]) -> St
         arr(packed)
     ));
 
-    // Imports.
+    // The import table in full, with each function's IAT slot so a consumer can
+    // correlate a name with the address code calls through. Nothing is filtered
+    // or sampled: this is the binary's own list.
     s.push_str("  \"imports\": [\n");
     for (i, imp) in bin.imports.iter().enumerate() {
         let comma = if i + 1 < bin.imports.len() { "," } else { "" };
-        let funcs = arr(imp.names().map(q).collect());
-        s.push_str(&format!("    {{\"dll\": {}, \"functions\": {}}}{comma}\n", q(&imp.dll), funcs));
+        let funcs: Vec<String> = imp
+            .functions
+            .iter()
+            .map(|f| {
+                let slot = match f.iat_rva {
+                    Some(rva) => rva.to_string(),
+                    None => "null".to_string(),
+                };
+                let ord = match f.ordinal {
+                    Some(o) => o.to_string(),
+                    None => "null".to_string(),
+                };
+                format!("{{\"name\": {}, \"iat_rva\": {slot}, \"ordinal\": {ord}}}", q(&f.name))
+            })
+            .collect();
+        s.push_str(&format!(
+            "    {{\"dll\": {}, \"functions\": [{}]}}{comma}\n",
+            q(&imp.dll),
+            funcs.join(", ")
+        ));
     }
     s.push_str("  ],\n");
     s.push_str(&format!(
@@ -96,19 +115,6 @@ pub fn report(path: &str, size: usize, bin: &Binary, findings: &[Finding]) -> St
         bin.total_imported_functions()
     ));
 
-    // Capability findings (M4).
-    s.push_str("  \"capabilities\": [\n");
-    for (i, f) in findings.iter().enumerate() {
-        let comma = if i + 1 < findings.len() { "," } else { "" };
-        let matched = arr(f.matched.iter().map(|m| q(m)).collect());
-        s.push_str(&format!(
-            "    {{\"capability\": {}, \"severity\": {}, \"matched\": {}}}{comma}\n",
-            q(f.capability),
-            q(&f.severity.to_string()),
-            matched
-        ));
-    }
-    s.push_str("  ],\n");
 
     // Strings + IOCs (M5).
     s.push_str(&format!(
@@ -168,8 +174,10 @@ mod tests {
 
     #[test]
     fn report_has_expected_keys_and_shape() {
-        let out = report("/bin/x", 123, &tiny_binary(), &[]);
-        for key in ["\"file\"", "\"format\"", "\"arch\"", "\"sections\"", "\"packing\"", "\"imports\"", "\"capabilities\"", "\"iocs\""] {
+        let out = report("/bin/x", 123, &tiny_binary());
+        for key in
+            ["\"file\"", "\"format\"", "\"arch\"", "\"sections\"", "\"packing\"", "\"imports\"", "\"iocs\""]
+        {
             assert!(out.contains(key), "missing {key} in:\n{out}");
         }
         assert!(out.contains("\"format\": \"ELF\""));
@@ -177,5 +185,34 @@ mod tests {
         // balanced braces/brackets is a cheap validity smoke test
         assert_eq!(out.matches('{').count(), out.matches('}').count());
         assert_eq!(out.matches('[').count(), out.matches(']').count());
+    }
+
+    #[test]
+    fn no_capability_or_scoring_field_is_emitted() {
+        // SMA lists; it does not grade. A consumer must not find a severity or
+        // a category to sort by, because inventing one is the analyst's call.
+        let out = report("/bin/x", 123, &tiny_binary());
+        for gone in ["capabilit", "severity", "score", "api_index", "verdict"] {
+            assert!(!out.contains(gone), "{gone} should not appear in:\n{out}");
+        }
+    }
+
+    #[test]
+    fn imports_carry_every_function_with_its_slot() {
+        use crate::binary::{Import, ImportedFn};
+        let mut bin = tiny_binary();
+        bin.imports = vec![Import {
+            dll: "KERNEL32.dll".into(),
+            functions: vec![
+                ImportedFn { name: "VirtualAlloc".into(), iat_rva: Some(0x2000), ordinal: None },
+                ImportedFn { name: "VirtualProtect".into(), iat_rva: Some(0x2008), ordinal: None },
+                ImportedFn { name: "#42".into(), iat_rva: Some(0x2010), ordinal: Some(42) },
+            ],
+        }];
+        let out = report("/bin/x", 123, &bin);
+        assert!(out.contains("\"VirtualAlloc\""));
+        assert!(out.contains("\"VirtualProtect\""), "nothing may be filtered out");
+        assert!(out.contains("\"iat_rva\": 8192")); // 0x2000
+        assert!(out.contains("\"ordinal\": 42"));
     }
 }

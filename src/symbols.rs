@@ -231,6 +231,13 @@ fn checked_offset(base: u64, disp: i64) -> Option<u64> {
     }
 }
 
+// "KERNEL32.dll" + "VirtualAlloc" -> "KERNEL32!VirtualAlloc". One spelling
+// everywhere, so a name from the import table and a name from a resolved call
+// site compare equal.
+pub fn qualified_name(dll: &str, func: &str) -> String {
+    format!("{}!{}", trim_dll_suffix(dll), func)
+}
+
 // "KERNEL32.dll" -> "KERNEL32", matching the DLL!API convention debuggers use.
 fn trim_dll_suffix(dll: &str) -> &str {
     let bytes = dll.as_bytes();

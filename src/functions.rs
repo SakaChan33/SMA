@@ -44,6 +44,8 @@ pub struct Inventory {
     pub functions: Vec<Function>,
     // Resolved API -> how many direct call sites reach it, most-called first.
     pub api_calls: Vec<(String, u64)>,
+    // Imported, but no call site in the sweep reaches it.
+    pub uncalled: Vec<String>,
     // Calls to a literal code address.
     pub direct_calls: u64,
     // Calls that reach an imported API, whether through a thunk or straight
@@ -165,6 +167,22 @@ pub fn discover(file: &[u8], bin: &Binary, syms: &Symbols) -> Result<Inventory, 
     let mut api_calls: Vec<(String, u64)> = api_counts.into_iter().collect();
     api_calls.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
+    // Imports the sweep never saw reached. An observation, not an accusation:
+    // delay-loaded imports, callees reached only through computed calls, and
+    // genuinely unused declarations all land here, and so does an import table
+    // padded to look ordinary. Which one it is, is the analyst's call.
+    let called: BTreeSet<&str> = api_calls.iter().map(|(n, _)| n.as_str()).collect();
+    let mut uncalled: Vec<String> = bin
+        .imports
+        .iter()
+        .flat_map(|imp| {
+            imp.names().map(move |n| crate::symbols::qualified_name(&imp.dll, n))
+        })
+        .filter(|q| !called.contains(q.as_str()))
+        .collect();
+    uncalled.sort();
+    uncalled.dedup();
+
     let functions = ordered
         .iter()
         .map(|&rva| Function {
@@ -178,6 +196,7 @@ pub fn discover(file: &[u8], bin: &Binary, syms: &Symbols) -> Result<Inventory, 
     Ok(Inventory {
         functions,
         api_calls,
+        uncalled,
         direct_calls,
         import_calls,
         indirect_calls,
@@ -244,11 +263,29 @@ pub fn write_text<W: Write>(w: &mut W, inv: &Inventory) -> io::Result<()> {
             inv.api_calls.len(),
             inv.imported_total
         )?;
-        for (name, count) in inv.api_calls.iter().take(20) {
+        for (name, count) in &inv.api_calls {
             writeln!(w, "  {count:>6}  {name}")?;
         }
-        if inv.api_calls.len() > 20 {
-            writeln!(w, "  ... {} more", inv.api_calls.len() - 20)?;
+    }
+    writeln!(w)?;
+
+    // The complement. Listed in full, because "declared but never reached" is
+    // the kind of thing that only matters once you can see the whole set.
+    if inv.uncalled.is_empty() {
+        writeln!(w, "never called   : none -- every import is reached by a resolvable call")?;
+    } else {
+        writeln!(
+            w,
+            "never called   : {} import(s) declared but never reached by any call site found here",
+            inv.uncalled.len()
+        )?;
+        writeln!(
+            w,
+            "                 delay-loading, computed calls, dead declarations and padding all\n\
+             \x20                look like this. it is an observation, not an accusation."
+        )?;
+        for name in &inv.uncalled {
+            writeln!(w, "      {name}")?;
         }
     }
     writeln!(w)?;
@@ -306,7 +343,9 @@ pub fn write_json<W: Write>(w: &mut W, path: &str, inv: &Inventory) -> io::Resul
         let comma = if i + 1 < inv.api_calls.len() { "," } else { "" };
         writeln!(w, "    {{\"api\": {}, \"call_sites\": {count}}}{comma}", q(name))?;
     }
-    writeln!(w, "  ]")?;
+    writeln!(w, "  ],")?;
+    let uncalled: Vec<String> = inv.uncalled.iter().map(|n| q(n)).collect();
+    writeln!(w, "  \"never_called\": [{}]", uncalled.join(", "))?;
     writeln!(w, "}}")
 }
 

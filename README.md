@@ -135,7 +135,7 @@ for further inspection, but it will never be 100% accurate.
 | **M1** | PE parser (DOS → NT headers → sections) → structured output | parse executable formats |
 | **M2** | Per-section Shannon entropy → packing heuristic | entropy, packer detection |
 | **M3** | Import table extraction (DLLs + APIs) | imported libraries/APIs |
-| **M4** | Suspicious-API rules (injection, anti-debug, persistence, net, crypto) | suspicious API usage |
+| **M4** | ~~Suspicious-API rules~~ → complete, unfiltered API listing | suspicious API usage |
 | **M5** | String + IOC extraction (URLs, IPs, registry keys) | recover embedded strings |
 | **M6** | Format-abstraction layer → add ELF | multi-platform abstraction |
 | **M7** | Control-Flow Graph for a function → Graphviz | CFG construction + viz |
@@ -254,7 +254,9 @@ sma hex sample.exe --headers                      # the header region
 
 `functions` is the bridge between the report and the disassembly: it lists every
 address worth looking at, alongside the imported APIs each one reaches, so you
-pick a target instead of guessing one.
+pick a target instead of guessing one. It also lists the complement — imports
+declared but never reached by any call site found, which is what delay-loading,
+computed calls, dead declarations and padding all look like.
 
 ```
   rva          calls  label                reaches (imported APIs)
@@ -274,12 +276,41 @@ rather than as an address:
 
 PE/ELF header summary (M1); **build metadata** — timestamp, subsystem,
 mitigations, signature, TLS callbacks, packer hints; per-section **entropy** +
-packing assessment (M2); **imports** (M3) and **exports** (including forwarders);
-**capability findings** with severities (M4); **strings + IOCs** (M5); any
-**overlay** appended past the last section; and finally the **limits** section.
+packing assessment (M2); the **complete import table** (M3) and **exports**
+(including forwarders); **strings + IOCs** (M5); any **overlay** appended past
+the last section; and finally the **limits** section.
 
-A finding is a *reason to look closer*, never definitive — benign software trips
-these rules constantly, which is the point the project is making.
+### Listing, not judging
+
+The tool lists what the binary declares. It does not decide which of those
+declarations matter.
+
+This replaced an earlier design that only reported a capability when two or more
+of its APIs were present, each graded by severity. That was wrong in kind. A
+threshold means the *tool* decides whether the analyst is allowed to see that a
+program calls `VirtualProtect` — and it failed exactly as you would predict: a
+self-injecting payload, tested against SMA, reported **no findings at all**,
+because it imported `VirtualAlloc` where the rule listed `VirtualAllocEx`, and
+`LoadLibraryExW` where the rule listed `LoadLibrary`.
+
+The obvious repair — enumerate every Windows API instead — is worse. Measured
+with SMA itself, System32 on one machine holds **3,575 DLLs exporting roughly
+108,000 functions**, and that excludes SysWOW64, third-party libraries, COM, and
+the undocumented `ntdll` natives. Any hand-written table is a filter whose gaps
+are invisible, which is the same defect at a larger scale.
+
+So there is no table. **The binary's import table is authoritative about what
+the binary imports**, it is already parsed, and it is printed entire — every
+library, every function, with the IAT slot the loader fills in. Grep does the
+rest, and composes better than any taxonomy:
+
+```sh
+sma scan payload.exe | findstr /i "virtual protect remote thread"
+```
+
+The single case where the import table is *not* the whole story — the program
+resolving APIs by name at runtime, or hiding them behind a packer — is not
+silently absorbed. It is reported, by name, in `limits`.
 
 ### The `limits` section
 
@@ -324,7 +355,6 @@ SMA/
     entropy.rs       Shannon entropy over a byte range
     packers.rs       packer identification from section names
     strings.rs       ASCII/UTF-16 extraction + IOC classification
-    rules.rs         suspicious-API capability rules
     limits.rs        what static analysis could not resolve, and what takes over
 
     symbols.rs       names for addresses: IAT lookup + import-thunk following
@@ -368,8 +398,8 @@ These are some additional questions to consider. Not necessarily for research pu
 | How many modules? | 21 |
 | How many unit tests? | 80 |
 | How many executable formats? | 2 (PE, ELF) |
-| How many APIs are recognized? | 67, across 9 capability rules |
-| How many heuristics? | 9 capability rules + 8 `limits` rules + 13 packer signatures |
+| How many APIs are recognized? | all of them — the import table is listed in full, with no dictionary in the way |
+| How many heuristics? | 8 `limits` rules + 13 packer signatures. Zero heuristics gate what gets displayed |
 | How many IOC types? | 4 (URL, IPv4, registry key, file path) |
 | What parser architecture? | Hand-rolled, bounds-checked `ByteReader`; every parse error is a value, never a panic |
 | What crates are used? | One: `capstone` (disassembly). Parsers, CLI, JSON, and graph code are std-only, on purpose |

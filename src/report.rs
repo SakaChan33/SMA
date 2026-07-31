@@ -6,11 +6,10 @@
 // closing `limits` section) about what they refuse to say.
 
 use crate::binary::{self, Binary, Format, Section};
-use crate::{limits, rules};
+use crate::limits;
 use std::io::{self, Write};
 
 const IOC_LIMIT: usize = 15;
-const IMPORT_SAMPLE: usize = 6;
 const EXPORT_LIMIT: usize = 20;
 
 pub fn write<W: Write>(w: &mut W, path: &str, file_len: usize, bin: &Binary) -> io::Result<()> {
@@ -19,7 +18,6 @@ pub fn write<W: Write>(w: &mut W, path: &str, file_len: usize, bin: &Binary) -> 
     sections(w, bin)?;
     imports(w, bin)?;
     exports(w, bin)?;
-    capabilities(w, bin)?;
     strings(w, bin)?;
     overlay(w, bin)?;
     writeln!(w)?;
@@ -233,32 +231,40 @@ fn sections<W: Write>(w: &mut W, bin: &Binary) -> io::Result<()> {
     writeln!(w)
 }
 
+// The binary's own import table, in full.
+//
+// No dictionary decides what appears here, because no dictionary can: System32
+// alone exports on the order of a hundred thousand functions across ~3,500
+// DLLs, and any hand-written list of "interesting" ones is a filter whose gaps
+// are invisible to the analyst. The import table is authoritative about what
+// this program declared, so it is printed entire -- every library, every
+// function, nothing sampled and nothing summarised.
+//
+// The one thing that can make it incomplete is the program hiding its own
+// imports, and that is exactly what the `limits` section reports.
 fn imports<W: Write>(w: &mut W, bin: &Binary) -> io::Result<()> {
-    // The program's declared capabilities. PE: DLLs + APIs. ELF: needed .so
-    // libraries + undefined dynamic symbols.
     let total = bin.total_imported_functions();
     let lib_word = if bin.format == Format::Pe { "DLL(s)" } else { "library/symbol group(s)" };
     writeln!(w, "imports        : {} {lib_word}, {total} function(s)", bin.imports.len())?;
-    for imp in &bin.imports {
-        let sample: Vec<&str> = imp.names().take(IMPORT_SAMPLE).collect();
-        let more = if imp.functions.len() > IMPORT_SAMPLE { " ..." } else { "" };
-        writeln!(w, "  {:<20} ({:>4})  {}{}", imp.dll, imp.functions.len(), sample.join(", "), more)?;
-    }
-    writeln!(w)
-}
 
-fn capabilities<W: Write>(w: &mut W, bin: &Binary) -> io::Result<()> {
-    // A rule fires only on a dangerous *combination* of APIs, because benign
-    // software uses nearly all of these individually.
-    let findings = rules::assess_imports(&bin.imports);
-    if findings.is_empty() {
-        writeln!(w, "capabilities   : none of the flagged categories detected")?;
-    } else {
-        let max = rules::max_severity(&findings).expect("non-empty findings have a max severity");
-        writeln!(w, "capabilities   : {} finding(s), highest severity {}", findings.len(), max)?;
-        for f in &findings {
-            let sample: Vec<&str> = f.matched.iter().take(4).map(|s| s.as_str()).collect();
-            writeln!(w, "  [{:<6}] {:<38} {}", f.severity, f.capability, sample.join(", "))?;
+    if bin.imports.is_empty() {
+        writeln!(w, "                 nothing imported -- see 'limits' below")?;
+        return writeln!(w);
+    }
+
+    writeln!(
+        w,
+        "                 listed in full, in import-table order. slot addresses are where the\n\
+         \x20                loader writes each function, which is what code calls through."
+    )?;
+    for imp in &bin.imports {
+        writeln!(w)?;
+        writeln!(w, "  {} ({} function(s))", imp.dll, imp.functions.len())?;
+        for f in &imp.functions {
+            match f.iat_rva {
+                Some(slot) => writeln!(w, "      {slot:#010x}  {}", f.name)?,
+                None => writeln!(w, "                  {}", f.name)?,
+            }
         }
     }
     writeln!(w)
